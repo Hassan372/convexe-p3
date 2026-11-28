@@ -111,26 +111,150 @@ class LanderSOCP:
         drift_v = cp.reshape(self.dvx, (N, 1), order="C") @ e1      # rows (dt w_k, 0)
         drift_r = cp.reshape(self.dpx, (N, 1), order="C") @ e1      # rows (dt^2/2 w_k, 0)
         # TODO (Question 3.1): the list `cons`: initial state (self.x0, self.zinit); dynamics of Question 2.1 written with `acc`, `drift_v`, `drift_r`; relaxation ||u_k|| <= sigma_k; Taylor bounds (with the variable `dz` = z - z0, which keeps the problem DPP); mass bounds zlo <= z <= zhi and z_N >= ln(m_dry); tilt cone; glide slope y_k - y_N >= tan(gamma) |x_k - x_N| for k = glide_from, ..., N. Then the fuel expression `fuel` = dt * sum(sigma)
-        raise NotImplementedError("Question 3.1")
+        
+         # ----------------------------------------------------------
+        # 1. Initial state
+        # ----------------------------------------------------------
+        cons = [
+            r[0, :] == self.x0[:2],
+            v[0, :] == self.x0[2:],
+            z[0] == self.zinit,
+        ]
+
+        # ----------------------------------------------------------
+        # 2. Dicrete dynamics
+        # ----------------------------------------------------------
+        # v_{k+1} = v_k + dt * (u_k + g) + drift_v
+        cons += [
+            v[1:] == v[:-1] + self.dt * acc + drift_v
+        ]
+
+        # r_{k+1} = r_k + dt*v_k + dt²/2*(u_k+g) + drift_r
+        cons += [
+            r[1:] == (
+                r[:-1]
+                + self.dt * v[:-1]
+                + 0.5 * self.dt2 * acc
+                + drift_r
+            )
+        ]
+
+        # z_{k+1} = z_k - alpha*dt*sigma_k
+        cons += [
+            z[1:] == z[:-1] - self.adt * s
+        ]
+
+        # ----------------------------------------------------------
+        # 3. Relaxation
+        # ----------------------------------------------------------
+        # ||u_k|| <= sigma_k
+        cons += [
+            cp.norm(u, 2, axis=1) <= s
+        ]
+
+        # ----------------------------------------------------------
+        # 4. Taylor bounds
+        # ----------------------------------------------------------
+        # dz_k = z_k - z0_k
+        cons += [
+            dz == z[:-1] - self.z0
+        ]
+
+        # rho1 * exp(-z0) * (1 - dz + dz²/2) <= sigma
+        cons += [
+            cp.multiply(
+                self.a1,
+                1 - dz + 0.5 * cp.square(dz)
+            ) <= s
+        ]
+
+        # sigma <= rho2 * exp(-z0) * (1 - dz)
+        cons += [
+            s <= cp.multiply(self.a2, 1 - dz)
+        ]
+
+        # ----------------------------------------------------------
+        # 5. Mass bounds
+        # ----------------------------------------------------------
+        cons += [
+            z >= self.zlo,
+            z <= self.zhi,
+            z[N] >= np.log(self.p.m_dry)
+        ]
+
+        # ----------------------------------------------------------
+        # 6. Tilt
+        # ----------------------------------------------------------
+        # u_y >= sigma * cos(theta_max)
+        cons += [
+            u[:, 1] >= s * np.cos(np.radians(theta_max_deg))
+        ]
+
+        # ----------------------------------------------------------
+        # 7. Glide slope
+        # ----------------------------------------------------------
+        # y_k - y_N >= |x_k - x_N| * tan(gamma)
+
+        glide_1 = (
+            r[glide_from:, 1] - r[N, 1]
+            >= self.tg * (
+                r[glide_from:, 0] - r[N, 0]
+            )
+        )
+
+        glide_2 = (
+            r[glide_from:, 1] - r[N, 1]
+            >= self.tg * (
+                r[N, 0] - r[glide_from:, 0]
+            )
+        )
+
+        cons += [glide_1, glide_2]
+
+        self.glide = (glide_1, glide_2)
+
+        # ----------------------------------------------------------
+        # 8. fuel expression
+        # ----------------------------------------------------------
+        fuel = self.dt * cp.sum(s)
+        
+    
         err = cp.abs(r[N, 0] - self.xt)              # horizontal landing error |x_N - x_target| (the target is 0)
         if terminal == "ground":
             # TODO (Question 3.1): touchdown at rest, y_N = 0 and v_N = 0 (append them to `cons`)
-            raise NotImplementedError("Question 3.1")
+
+            cons += [
+                r[N, 1] == 0.0
+            ]
+
+            cons += [
+                v[N, :] == 0.0
+            ]
+
         else:                                        # approach gate above the pad (provided; used from Question 4 on)
             cons += [r[N, 1] == y_gate, v[N, 0] == 0.0, v[N, 1] == -v_gate]
         if mode == "fuel":
             if terminal == "ground":
                 # TODO (Question 3.1): land at the target, x_N = x_target (`self.xt`, which is 0) (append it to `cons`)
-                raise NotImplementedError("Question 3.1")
+                
+                cons += [
+                    r[N, 0] == self.xt
+                ]
+
             else:
                 cons += [err <= x_tol]
+
             obj = fuel
         elif mode == "error":
             # TODO (Question 3.2): the objective `obj`, the landing error `err`
-            raise NotImplementedError("Question 3.2")
+            obj = err
+
         elif mode == "fuel_with_error_bound":
             # TODO (Question 3.2): the objective `obj` (the fuel) and the bound `err` <= `self.dmax` (append it to `cons`)
-            raise NotImplementedError("Question 3.2")
+            
+            cons += [err <= self.dmax]
+            obj = fuel
+
         else:
             raise ValueError(mode)
         # ---------------- extensions used in Question 5 (hazards, trust region, approach cone, map)
@@ -168,7 +292,27 @@ class LanderSOCP:
         t = np.arange(N + 1) * dt
         rho1, rho2 = p.rho1, self.thrust_frac * p.rho2
         # TODO (Question 3.1): set the values of every horizon-dependent parameter: dt, dt2 (= dt^2), adt (= alpha dt), z0, a1, a2, zlo, zhi at the times t_k (use the local rho1, rho2: rho2 includes the factor thrust_frac)
-        raise NotImplementedError("Question 3.1")
+        
+        # time steps
+        self.dt.value = dt
+        self.dt2.value = dt**2
+        self.adt.value = p.alpha * dt
+
+        # Taylor's expansion point
+        z0 = np.log(m0 - p.alpha * rho2 * t[:-1])
+        self.z0.value = z0
+
+        # Taylor's expansion coefficient
+        self.a1.value = rho1 * np.exp(-z0)
+        self.a2.value = rho2 * np.exp(-z0)
+
+        # log-mass bounds
+        self.zlo.value = np.full(N + 1, np.log(p.m_dry))
+        self.zhi.value = np.log(m0 - p.alpha * rho1 * t)
+
+        # Initial mass
+        self.zinit.value = np.log(m0)
+
         self.zinit.value = np.log(m0)
         return t
 
@@ -254,11 +398,180 @@ def solve_min_fuel(prob, x0, m0=None, n_grid=25, tol=0.02, certify=True):
     With certify=True, a solution whose relaxation gap is not zero counts as infeasible: we search
     over CERTIFIED (lossless) solutions only. Returns (best LanderSolution or None, evaluations)."""
     # TODO (Question 3.1): coarse grid of n_grid points on tgo_bounds, then golden_section around the best grid point; with certify=True, a tgo whose solution fails is_lossless counts as infeasible (infinite fuel); return (best solution or None, sorted list of (tgo, fuel))
-    raise NotImplementedError("Question 3.1")
+    
+    # Bornes sur le temps de vol
+    t_min, t_max = tgo_bounds(prob.p, x0, m0)
 
+    # Grille initiale
+    t_grid = np.linspace(t_min, t_max, n_grid)
+
+    # Stockage des évaluations
+    evaluations = []
+    solutions = {}
+    
+
+    
+    def evaluate(tgo):
+        sol = prob.solve(x0, tgo, m0)
+
+        if sol is None:
+            fuel = np.inf
+        elif certify and not is_lossless(sol):
+            fuel = np.inf
+        else:
+            fuel = sol.fuel
+            solutions[tgo] = sol
+
+        evaluations.append((tgo, fuel))
+        return fuel
+
+    # 3. Evaluate all points of the initial grid
+    for tgo in t_grid:
+        evaluate(tgo)
+
+    # 4. Find the best feasible point on the grid
+    feasible = [(t, fuel) for t, fuel in evaluations
+                if np.isfinite(fuel)]
+
+    if not feasible:
+        return None, sorted(evaluations)
+
+    best_tgo, best_fuel = min(feasible, key=lambda item: item[1])
+
+    # 5. Define the interval surrounding the best grid point
+    idx = np.argmin(np.abs(t_grid - best_tgo))
+
+    a = t_grid[max(0, idx - 1)]
+    b = t_grid[min(n_grid - 1, idx + 1)]
+
+    # 6. Golden-section search in this smaller interval
+    if b - a > tol:
+        golden_section(evaluate, a, b, tol=tol)
+
+    # 7. Retrieve the best feasible solution among ALL evaluations
+    feasible = [(t, fuel) for t, fuel in evaluations
+                if np.isfinite(fuel)]
+
+    best_tgo, best_fuel = min(feasible, key=lambda item: item[1])
+    best_sol = solutions[best_tgo]
+
+    # 8. Sort evaluations by time of flight
+    evaluations.sort(key=lambda item: item[0])
+
+    return best_sol, evaluations
+    
 
 def solve_min_landing_error(p, x0, m0=None, N=40, g=-10.0, n_grid=25, tol=0.02, certify=True, **kw):
     """Two-stage guidance of Blackmore et al. (2010) for targets that cannot be reached:
     stage 1 finds d* = min over tgo of the landing error; stage 2 minimizes the fuel with error <= d*."""
     # TODO (Question 3.2): stage 1: LanderSOCP with mode='error' and the same search as solve_min_fuel (landing error instead of fuel); stage 2: LanderSOCP with mode='fuel_with_error_bound', dmax = d_star + 1 mm, solved at the best tgo; return (solution, d_star, sorted list of (tgo, error))
-    raise NotImplementedError("Question 3.2")
+    
+    # ----------------------------------------------------------
+    # STAGE 1: Minimum landing error
+    # ----------------------------------------------------------
+
+    # Create an optimization problem minimizing landing error
+    prob_error = LanderSOCP(
+        p=p,
+        N=N,
+        g=g,
+        mode="error",
+        terminal="ground",
+        **kw
+    )
+
+    # Search over the time of flight
+    t_min, t_max = tgo_bounds(p, x0, m0)
+    t_grid = np.linspace(t_min, t_max, n_grid)
+
+    evaluations = []
+    solutions = {}
+
+    def evaluate(tgo):
+        sol = prob_error.solve(x0, tgo, m0)
+
+        if sol is None:
+            error = np.inf
+
+        elif certify and not is_lossless(sol):
+            error = np.inf
+
+        else:
+            error = sol.landing_error
+            solutions[tgo] = sol
+
+        evaluations.append((tgo, error))
+        return error
+
+    # Evaluate the initial grid
+    for tgo in t_grid:
+        evaluate(tgo)
+
+    # Find the best feasible grid point
+    feasible = [
+        (t, error)
+        for t, error in evaluations
+        if np.isfinite(error)
+    ]
+
+    if not feasible:
+        return None, np.inf, sorted(evaluations)
+
+    best_tgo, best_error = min(
+        feasible,
+        key=lambda item: item[1]
+    )
+
+    # Search locally around the best grid point
+    idx = np.argmin(np.abs(t_grid - best_tgo))
+
+    a = t_grid[max(0, idx - 1)]
+    b = t_grid[min(n_grid - 1, idx + 1)]
+
+    if b - a > tol:
+        golden_section(evaluate, a, b, tol=tol)
+
+    # Retrieve the best Stage 1 solution
+    feasible = [
+        (t, error)
+        for t, error in evaluations
+        if np.isfinite(error)
+    ]
+
+    best_tgo, d_star = min(
+        feasible,
+        key=lambda item: item[1]
+    )
+
+    # ----------------------------------------------------------
+    # STAGE 2: Minimum fuel for best landing precision
+    # ----------------------------------------------------------
+
+    prob_fuel = LanderSOCP(
+        p=p,
+        N=N,
+        g=g,
+        mode="fuel_with_error_bound",
+        terminal="ground",
+        **kw
+    )
+
+    # Allow a 1 mm numerical tolerance
+    prob_fuel.dmax.value = d_star + 0.001
+
+    # Solve at the optimal Stage 1 flight time
+    best_sol = prob_fuel.solve(
+        x0,
+        best_tgo,
+        m0
+    )
+
+    # Return the Stage 2 solution, optimal landing error,
+    # and sorted Stage 1 evaluations
+    evaluations.sort(key=lambda item: item[0])
+
+    if best_sol is None or (certify and not is_lossless(best_sol)):
+        return None, d_star, sorted(evaluations)
+
+    return best_sol, d_star, evaluations
+
